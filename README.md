@@ -3,6 +3,8 @@
 基于 Python + FastAPI 的无状态服务：提交一段原文和若干候选敏感片段，服务在
 **互不重叠**的前提下选出最优片段组合，并用等长的 `█`（U+2588 FULL BLOCK）
 遮盖原文。片段之间允许重叠（提交时无需预处理），相邻片段可同时入选。
+另提供 `POST /redact/revise`：先按码点区间编辑修订原文，自动作废旧片段、
+迁移保留片段，再完成选择与遮盖。
 
 ## 一条命令启动
 
@@ -111,6 +113,116 @@ curl -s http://localhost:8000/redact \
 - 整数 ID 与字符串 ID 混用；
 - 请求体不是合法 JSON。
 
+### `POST /redact/revise`
+
+先把一批编辑一次性应用到原文，再对**未被编辑波及**的片段做最优选择与遮盖。
+片段与编辑区间均按**修订前原文**的 Unicode 码点定位。
+
+请求体（`Content-Type: application/json`）：`text` 与 `fragments` 字段同
+`POST /redact`，另需 `edits` 数组：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `edits` | array | 编辑列表，按原文码点定位，一次性应用 |
+| `edits[].start` | integer | 编辑起始位置，**左闭**，`>= 0` |
+| `edits[].end` | integer | 编辑结束位置，**右开**；`start == end` 表示纯插入 |
+| `edits[].replacement` | string | 替换文本；空字符串表示删除 `[start, end)` |
+
+返回体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `revised_text` | 应用全部编辑后的原文 |
+| `invalidated_ids` | 被编辑波及而作废的片段 ID，按升序排列 |
+| `selected_ids` | 保留片段中入选的 ID，按升序排列 |
+| `rejected_ids` | 保留片段中落选的 ID，按升序排列（**不含**作废 ID） |
+| `masked_text` | 修订后正文中入选片段以等长 `█` 遮盖的结果（长度与 `revised_text` 一致） |
+
+#### 片段作废与迁移规则
+
+对每个旧片段：
+
+- 删除/替换区间与片段**有交集**，或插入点**严格落在片段内部**
+  （`start < p < end`）：片段**作废**，进入 `invalidated_ids`；
+- 插入在片段**起点**：整段右移，插入内容不并入片段；
+- 插入在片段**终点**：不扩展片段，区间不变；
+- 其余保留片段长度不变，按前方编辑的**累计码点位移**整体平移区间，
+  再参与与 `POST /redact` 相同的最优选择与遮盖。
+
+#### 编辑校验规则（不合法请求返回 HTTP 400）
+
+- 缺少 `edits`，或编辑缺少 `start` / `end` / `replacement`；
+- 类型错误：位置不是整数（不接受 `1.0`、`true`），`replacement` 不是字符串；
+- 区间越界（`start < 0` 或 `end > 原文码点长度`）或逆序（`start > end`）；
+- 编辑区间彼此重叠（相邻，即前一区间 `end ==` 后一区间 `start`，不算重叠）；
+- 同一位置的多次插入；
+- `text` / `fragments` 的校验规则与 `POST /redact` 一致。
+
+#### 示例
+
+```bash
+curl -s http://localhost:8000/redact/revise \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "你好，世界！",
+    "fragments": [
+      {"id": 1, "weight": 5, "start": 0, "end": 2},
+      {"id": 2, "weight": 3, "start": 3, "end": 5}
+    ],
+    "edits": [
+      {"start": 2, "end": 3, "replacement": "！"},
+      {"start": 6, "end": 6, "replacement": "再见"}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "revised_text": "你好！世界！再见",
+  "invalidated_ids": [],
+  "selected_ids": [1, 2],
+  "rejected_ids": [],
+  "masked_text": "██！██！再见"
+}
+```
+
+编辑与两个片段均只是相邻而非相交，插入在文末，因此没有片段作废，两个片段
+区间不变、同时入选。
+
+删除与片段相交、其余片段随位移迁移的例子：
+
+```bash
+curl -s http://localhost:8000/redact/revise \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "abcdef",
+    "fragments": [
+      {"id": 1, "weight": 1, "start": 1, "end": 3},
+      {"id": 2, "weight": 1, "start": 4, "end": 6}
+    ],
+    "edits": [
+      {"start": 2, "end": 4, "replacement": ""}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "revised_text": "abef",
+  "invalidated_ids": [1],
+  "selected_ids": [2],
+  "rejected_ids": [],
+  "masked_text": "ab██"
+}
+```
+
+删除区间 `[2,4)` 与片段 1（`[1,3)`）相交，片段 1 作废；片段 2（`[4,6)`）
+在删除之后，整体左移 2 个码点至 `[2,4)`，遮盖修订后文本中的 `"ef"`。
+
 ## 码点计数说明
 
 位置与遮盖均以 **Unicode 码点**为单位（即 Python 3 中 `str` 的索引与
@@ -130,7 +242,8 @@ uvicorn app.main:app --reload --port 8000   # 启动开发服务器
 pytest -q                                    # 运行测试
 ```
 
-测试包含核心算法单元测试、API 端到端测试，以及 300 组随机用例下
+测试包含核心算法（选择、遮盖、编辑应用、片段迁移）单元测试、两个 API 端点的
+端到端测试，以及 300 组随机用例下
 动态规划结果与 2^n 暴力枚举的对照校验。
 
 ## 项目结构

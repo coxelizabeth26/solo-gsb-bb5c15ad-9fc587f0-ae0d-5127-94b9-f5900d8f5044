@@ -9,14 +9,22 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .redaction import Fragment, mask_text, select_fragments
+from .redaction import (
+    Edit,
+    Fragment,
+    apply_edits,
+    mask_text,
+    migrate_fragment,
+    select_fragments,
+)
 
 app = FastAPI(
     title="敏感片段遮盖 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "提交原文及候选片段（含唯一 ID、正整数权重、左闭右开码点区间），"
         "返回互不重叠的最优入选组合、落选 ID 与等长遮盖文本。"
+        "支持按码点区间编辑修订原文：作废旧片段、迁移保留片段后再选择遮盖。"
     ),
 )
 
@@ -70,10 +78,73 @@ REDACT_REQUEST_SCHEMA = {
 }
 
 
+# /redact/revise 的请求体 JSON Schema；edits 的语义校验由 validate_revise_payload 执行。
+REVISE_REQUEST_SCHEMA = {
+    "type": "object",
+    "required": ["text", "fragments", "edits"],
+    "properties": {
+        "text": REDACT_REQUEST_SCHEMA["properties"]["text"],
+        "fragments": REDACT_REQUEST_SCHEMA["properties"]["fragments"],
+        "edits": {
+            "type": "array",
+            "description": (
+                "按原文码点定位的编辑，一次性应用；区间须互不重叠，"
+                "同一位置不允许多次插入"
+            ),
+            "items": {
+                "type": "object",
+                "required": ["start", "end", "replacement"],
+                "properties": {
+                    "start": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "编辑起始码点位置（含）",
+                    },
+                    "end": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "编辑结束码点位置（不含）；等于 start 时为纯插入",
+                    },
+                    "replacement": {
+                        "type": "string",
+                        "description": "替换文本；空字符串表示删除该区间",
+                    },
+                },
+            },
+        },
+    },
+    "example": {
+        "text": "你好，世界！",
+        "fragments": [
+            {"id": 1, "weight": 5, "start": 0, "end": 2},
+            {"id": 2, "weight": 3, "start": 3, "end": 5},
+        ],
+        "edits": [
+            {"start": 2, "end": 3, "replacement": "！"},
+            {"start": 6, "end": 6, "replacement": "再见"},
+        ],
+    },
+}
+
+
 class RedactOut(BaseModel):
     selected_ids: list[int | str] = Field(..., description="入选片段 ID（升序）")
     rejected_ids: list[int | str] = Field(..., description="落选片段 ID（升序）")
     masked_text: str = Field(..., description="入选片段以等长 █ 遮盖后的正文")
+
+
+class ReviseOut(BaseModel):
+    revised_text: str = Field(..., description="应用全部编辑后的原文")
+    invalidated_ids: list[int | str] = Field(
+        ..., description="被编辑波及而作废的片段 ID（升序）"
+    )
+    selected_ids: list[int | str] = Field(
+        ..., description="保留片段中入选的 ID（升序）"
+    )
+    rejected_ids: list[int | str] = Field(
+        ..., description="保留片段中落选的 ID（升序，不含作废）"
+    )
+    masked_text: str = Field(..., description="修订后正文中入选片段以等长 █ 遮盖的结果")
 
 
 def _bad(message: str) -> ValueError:
@@ -82,14 +153,34 @@ def _bad(message: str) -> ValueError:
 
 
 def validate_payload(payload: Any) -> tuple[str, list[Fragment]]:
-    """严格校验请求体，返回 ``(原文, Fragment 列表)``。
+    """严格校验 /redact 请求体，返回 ``(原文, Fragment 列表)``。
 
     任何不合法输入（类型错误、越界、空片段、重复 ID 等）均抛出
     ``ValueError``，由上层转为 HTTP 400。
     """
     if not isinstance(payload, dict):
         raise _bad("请求体必须是 JSON 对象，包含 text 与 fragments 字段")
+    return _validate_text_and_fragments(payload)
 
+
+def validate_revise_payload(payload: Any) -> tuple[str, list[Fragment], list[Edit]]:
+    """严格校验 /redact/revise 请求体，返回 ``(原文, Fragment 列表, Edit 列表)``。
+
+    片段与编辑区间均按原文码点定位；编辑越界、逆序、彼此重叠或同一位置
+    多次插入均抛出 ``ValueError``，由上层转为 HTTP 400。
+    """
+    if not isinstance(payload, dict):
+        raise _bad("请求体必须是 JSON 对象，包含 text、fragments 与 edits 字段")
+    text, fragments = _validate_text_and_fragments(payload)
+
+    if "edits" not in payload:
+        raise _bad("缺少字段：edits")
+    edits = _validate_edits(text, payload["edits"])
+    return text, fragments, edits
+
+
+def _validate_text_and_fragments(payload: dict) -> tuple[str, list[Fragment]]:
+    """校验 ``text`` 与 ``fragments`` 字段（``payload`` 已确认是对象）。"""
     if "text" not in payload:
         raise _bad("缺少字段：text")
     text = payload["text"]
@@ -161,6 +252,56 @@ def validate_payload(payload: Any) -> tuple[str, list[Fragment]]:
     return text, fragments
 
 
+def _validate_edits(text: str, raw_edits: Any) -> list[Edit]:
+    """校验编辑列表，返回按原文定位、互不重叠的 ``Edit`` 列表。"""
+    if not isinstance(raw_edits, list):
+        raise _bad("edits 必须是数组")
+
+    edits: list[Edit] = []
+    for index, item in enumerate(raw_edits):
+        where = f"edits[{index}]"
+        if not isinstance(item, dict):
+            raise _bad(f"{where} 必须是对象")
+
+        for field in ("start", "end", "replacement"):
+            if field not in item:
+                raise _bad(f"{where} 缺少字段：{field}")
+
+        start = item["start"]
+        end = item["end"]
+        replacement = item["replacement"]
+        if isinstance(start, bool) or not isinstance(start, int):
+            raise _bad(f"{where}.start 必须是整数")
+        if isinstance(end, bool) or not isinstance(end, int):
+            raise _bad(f"{where}.end 必须是整数")
+        if not isinstance(replacement, str):
+            raise _bad(f"{where}.replacement 必须是字符串")
+        if start < 0:
+            raise _bad(f"{where}.start 不能为负数")
+        if end > len(text):
+            raise _bad(f"{where} 越界：end={end} 超出原文码点长度 {len(text)}")
+        if start > end:
+            raise _bad(
+                f"{where} 区间逆序：要求 start <= end，实际 start={start}, end={end}"
+            )
+
+        edits.append(Edit(start=start, end=end, replacement=replacement))
+
+    # 重叠检测：按 (start, end) 排序后只需检查相邻两项。
+    # 相邻（prev.end == curr.start）不算重叠，但同一位置的两次插入必须拒绝。
+    ordered = sorted(edits, key=lambda e: (e.start, e.end))
+    for prev, curr in zip(ordered, ordered[1:]):
+        if curr.start < prev.end:
+            raise _bad(
+                f"编辑区间彼此重叠：[{prev.start}, {prev.end}) 与 "
+                f"[{curr.start}, {curr.end})"
+            )
+        if prev.is_insertion and curr.is_insertion and prev.start == curr.start:
+            raise _bad(f"同一位置 {curr.start} 的多次插入不被允许")
+
+    return edits
+
+
 @app.exception_handler(ValueError)
 async def value_error_handler(_request: Request, exc: ValueError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc)})
@@ -202,5 +343,45 @@ async def redact(request: Request) -> RedactOut:
     return RedactOut(
         selected_ids=list(selected),
         rejected_ids=[i for i in all_ids if i not in set(selected)],
+        masked_text=masked,
+    )
+
+
+@app.post(
+    "/redact/revise",
+    response_model=ReviseOut,
+    tags=["遮盖"],
+    summary="应用编辑修订原文，迁移片段后再选择遮盖",
+    openapi_extra={"requestBody": {"content": {"application/json": {"schema": REVISE_REQUEST_SCHEMA}}}},
+)
+async def revise(request: Request) -> ReviseOut:
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise _bad("请求体不是合法的 JSON")
+    text, fragments, edits = validate_revise_payload(payload)
+
+    revised = apply_edits(text, edits)
+
+    kept: list[Fragment] = []
+    invalidated: list[int | str] = []
+    for frag in fragments:
+        migrated = migrate_fragment(frag, edits)
+        if migrated is None:
+            invalidated.append(frag.id)
+        else:
+            kept.append(migrated)
+
+    selected = select_fragments(kept)
+    selected_set = set(selected)
+    by_id = {f.id: f for f in kept}
+    chosen = [by_id[fragment_id] for fragment_id in selected]
+
+    masked = mask_text(revised, chosen)
+    return ReviseOut(
+        revised_text=revised,
+        invalidated_ids=sorted(invalidated),
+        selected_ids=list(selected),
+        rejected_ids=sorted(f.id for f in kept if f.id not in selected_set),
         masked_text=masked,
     )

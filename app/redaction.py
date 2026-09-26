@@ -6,6 +6,9 @@
 - 文本位置按 Unicode 码点（Python ``str`` 的索引）计数，区间为左闭右开
   ``[start, end)``；``[0, 3)`` 与 ``[3, 5)`` 互不重叠，可同时入选。
 - 片段 ID 允许为整数或字符串，一次请求内类型须一致。
+- 编辑（``Edit``）把原文 ``[start, end)`` 替换为 ``replacement``；
+  ``start == end`` 时为纯插入，``replacement == ""`` 时为纯删除。
+  一批编辑须互不重叠，应用时按起点排序后一次性生效。
 """
 
 from __future__ import annotations
@@ -32,6 +35,73 @@ class Fragment:
     @property
     def length(self) -> int:
         return self.end - self.start
+
+
+@dataclass(frozen=True)
+class Edit:
+    """一处对原文的编辑：把 ``[start, end)`` 替换为 ``replacement``。"""
+
+    start: int
+    end: int
+    replacement: str
+
+    @property
+    def is_insertion(self) -> bool:
+        """纯插入（空区间）。"""
+        return self.start == self.end
+
+    @property
+    def delta(self) -> int:
+        """该编辑引起的码点位移（新长度 - 旧长度）。"""
+        return len(self.replacement) - (self.end - self.start)
+
+
+def apply_edits(text: str, edits: Sequence[Edit]) -> str:
+    """把互不重叠的编辑一次性应用到原文，返回修订后文本。
+
+    所有区间均按原文定位；编辑之间互不影响（同一位置的插入先于
+    同起点的替换生效）。调用方须保证编辑已经过校验、互不重叠。
+    """
+    parts: list[str] = []
+    cursor = 0
+    for edit in sorted(edits, key=lambda e: (e.start, e.end)):
+        parts.append(text[cursor : edit.start])
+        parts.append(edit.replacement)
+        cursor = edit.end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def migrate_fragment(fragment: Fragment, edits: Sequence[Edit]) -> Fragment | None:
+    """把片段区间迁移到修订后文本；被编辑波及时返回 ``None``（作废）。
+
+    作废规则：
+    - 删除/替换区间与片段有交集；
+    - 插入点严格落在片段内部（``start < p < end``）。
+
+    迁移规则（片段长度不变，整体平移）：
+    - 插入在片段起点：整段右移，插入内容不并入片段；
+    - 插入在片段终点：不扩展片段，区间不变；
+    - 其余情况按前方编辑的累计码点位移平移区间。
+    """
+    shift = 0
+    for edit in edits:
+        if edit.is_insertion:
+            if fragment.start < edit.start < fragment.end:
+                return None
+            if edit.start <= fragment.start:
+                shift += edit.delta
+        else:
+            if edit.start < fragment.end and fragment.start < edit.end:
+                return None
+            if edit.end <= fragment.start:
+                shift += edit.delta
+    return Fragment(
+        id=fragment.id,
+        weight=fragment.weight,
+        start=fragment.start + shift,
+        end=fragment.end + shift,
+    )
 
 
 def _insert_sorted(ids: tuple[ID, ...], value: ID) -> tuple[ID, ...]:
